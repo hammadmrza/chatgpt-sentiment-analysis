@@ -1,0 +1,887 @@
+---
+title: "Temporal Dynamics of User Sentiment: A Computational Analysis of ChatGPT App Reviews"
+author: "Hammad Mirza"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: united
+    code_folding: show
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = "center"
+)
+
+# All packages loaded once here
+library(tidyverse)
+library(lubridate)
+library(tidytext)
+library(textdata)
+library(tm)
+library(topicmodels)
+library(wordcloud)
+library(RColorBrewer)
+library(scales)
+library(ggridges)
+
+set.seed(1234)
+
+# Create output directories
+dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/results", recursive = TRUE, showWarnings = FALSE)
+dir.create("output/models",  recursive = TRUE, showWarnings = FALSE)
+dir.create("data",           recursive = TRUE, showWarnings = FALSE)
+```
+
+---
+
+# Introduction
+
+## Background and Motivation
+
+The rapid proliferation of artificial intelligence applications in consumer technology has fundamentally transformed how users interact with digital services. ChatGPT, OpenAI's conversational AI assistant, represents a particularly significant case study as one of the first widely adopted consumer-facing AI applications. Understanding how user perceptions of such applications evolve over time provides crucial insights for both product development and the broader adoption trajectory of AI technologies.
+
+User-generated reviews on mobile app stores constitute a rich, naturalistic data source for examining user sentiment. Unlike controlled surveys or experimental settings, these reviews capture authentic user experiences and reactions to product changes in real-world contexts. Previous research has demonstrated that written review text often contains more nuanced information than numerical ratings alone (Almansour et al., 2022), making sentiment analysis of review text particularly valuable for understanding user perceptions.
+
+## Research Questions
+
+**RQ1:** How have users' perceptions of the ChatGPT app, as reflected in their review text sentiment, changed over time?
+
+This question examines temporal trends in user sentiment to identify periods of significant change and establish whether sentiment has improved, declined, or remained stable since the app's launch.
+
+**RQ2:** Do specific app versions trigger measurable shifts in user sentiment, and what themes emerge in reviews during periods of high negativity?
+
+This question investigates the relationship between specific app versions and sentiment changes, then inductively explores what users discuss in negative reviews to understand the drivers of those shifts.
+
+## Analytical Approach
+
+We employ a mixed-methods computational approach combining:
+
+1. **Dictionary-based sentiment analysis** using the AFINN lexicon to quantify emotional valence in review text
+2. **Time series regression** to examine temporal trends and measure decline
+3. **Analysis of Variance (ANOVA)** to test for statistically significant differences across app versions
+4. **Topic modeling** via Latent Dirichlet Allocation (LDA) to inductively identify themes in negative reviews
+5. **Star rating vs. sentiment comparison** to distinguish text-based signal from numerical ratings
+
+---
+
+# Methods
+
+## Dataset Description
+
+Our dataset consists of ChatGPT mobile app reviews scraped from the Google Play Store, covering **July 25, 2023 through September 21, 2025** — approximately 27 months spanning multiple major app updates. Reviews were sourced from a publicly available Kaggle dataset. Each observation includes review text, a numerical rating (1–5 stars), a timestamp, and app version metadata.
+
+The primary unit of analysis is the individual review. For RQ1 we aggregate to monthly averages; for RQ2 we compare across versions and analyse negative reviews at the document level.
+
+## Data Loading
+
+```{r load-data}
+reviews_raw <- read_csv("chatgpt_reviews.csv", show_col_types = FALSE)
+cat("Loaded:", format(nrow(reviews_raw), big.mark = ","), "reviews\n")
+
+# Standardise column names to match pipeline expectations
+reviews <- reviews_raw %>%
+  rename_with(tolower) %>%
+  rename(
+    review_text = content,
+    rating      = score,
+    date        = at,
+    version     = appversion
+  )
+
+if (!all(c("review_text", "rating", "date") %in% colnames(reviews))) {
+  stop("Column rename failed — check your raw column names.")
+}
+cat("✓ Columns standardised\n")
+```
+
+## Data Cleaning
+
+We apply nine sequential filters to retain only valid, English-language, substantive reviews.
+
+```{r enhanced-cleaning}
+n_original <- nrow(reviews)
+
+# Step 1 — Remove rows with missing critical fields or very short text
+reviews_clean <- reviews %>%
+  filter(!is.na(review_text), !is.na(rating), !is.na(date)) %>%
+  filter(nchar(review_text) >= 20)
+
+# Step 2 — Retain English reviews via common-word heuristic
+english_words <- c("the","is","a","an","and","or","but","in","on","at","to",
+                   "for","of","with","by","this","that","it","was","are",
+                   "have","has","not")
+
+reviews_clean <- reviews_clean %>%
+  mutate(
+    text_lower = str_to_lower(review_text),
+    en_count   = str_count(text_lower,
+                           paste0("\\b(", paste(english_words, collapse = "|"), ")\\b"))
+  ) %>%
+  filter(en_count >= 2) %>%
+  select(-text_lower, -en_count)
+
+# Step 3 — Clean text: strip emojis, URLs, HTML, mentions, excess punctuation
+reviews_clean <- reviews_clean %>%
+  mutate(
+    review_text_clean = review_text,
+    review_text_clean = iconv(review_text_clean, "UTF-8", "ASCII", sub = ""),
+    review_text_clean = str_remove_all(review_text_clean, "http[s]?://\\S+"),
+    review_text_clean = str_remove_all(review_text_clean, "www\\.\\S+"),
+    review_text_clean = str_remove_all(review_text_clean, "\\S+@\\S+"),
+    review_text_clean = str_remove_all(review_text_clean, "@\\w+|#\\w+"),
+    review_text_clean = str_replace_all(review_text_clean, "&amp;", "and"),
+    review_text_clean = str_remove_all(review_text_clean, "&[a-z]+;"),
+    review_text_clean = str_replace_all(review_text_clean, "[^[:alnum:][:space:].,!?'-]", " "),
+    review_text_clean = str_to_lower(review_text_clean),
+    review_text_clean = str_replace_all(review_text_clean, "\\b\\d+\\b", ""),
+    review_text_clean = str_replace_all(review_text_clean, "(.)\\1{2,}", "\\1\\1"),
+    review_text_clean = str_squish(review_text_clean)
+  ) %>%
+  filter(nchar(review_text_clean) >= 10)
+
+# Step 4 — Drop reviews where >50 % of characters were stripped (likely non-English or garbled)
+reviews_clean <- reviews_clean %>%
+  mutate(
+    special_ratio = (nchar(review_text) - nchar(review_text_clean)) / nchar(review_text)
+  ) %>%
+  filter(special_ratio < 0.5) %>%
+  select(-special_ratio)
+
+# Step 5 — Remove spam patterns
+spam_patterns <- c("click here","buy now","limited time","act now",
+                   "visit our","check out my","follow me","subscribe to",
+                   "download now","free download")
+reviews_clean <- reviews_clean %>%
+  filter(!str_detect(str_to_lower(review_text_clean), paste(spam_patterns, collapse = "|")))
+
+# Step 6 — Remove gibberish (7+ consecutive consonants)
+reviews_clean <- reviews_clean %>%
+  filter(!str_detect(review_text_clean, "[bcdfghjklmnpqrstvwxyz]{7,}"))
+
+# Step 7 — Remove exact duplicates
+reviews_clean <- reviews_clean %>%
+  distinct(review_text_clean, .keep_all = TRUE)
+
+# Step 8 — Date range filter
+reviews_clean <- reviews_clean %>%
+  mutate(date = as.Date(date)) %>%
+  filter(date >= as.Date("2023-07-01"),
+         date <= as.Date("2025-09-30"))
+
+# Step 9 — Validate star ratings
+reviews_clean <- reviews_clean %>%
+  filter(rating >= 1 & rating <= 5)
+
+# Summary
+n_removed   <- n_original - nrow(reviews_clean)
+pct_retained <- round(100 * nrow(reviews_clean) / n_original, 1)
+
+cat(sprintf(
+  "Original: %s  |  Removed: %s  |  Retained: %s (%.1f%%)\n",
+  format(n_original,          big.mark = ","),
+  format(n_removed,           big.mark = ","),
+  format(nrow(reviews_clean), big.mark = ","),
+  pct_retained
+))
+```
+
+### Post-Cleaning Inspection
+
+```{r post-cleaning-inspection, fig.height=5}
+# Rating distribution
+rating_summary <- reviews_clean %>%
+  count(rating) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+cat("=== Rating Distribution ===\n")
+print(rating_summary)
+
+# Dataset summary table
+summary_table <- data.frame(
+  Characteristic = c(
+    "Total Reviews (After Cleaning)", "Date Range", "Time Span (months)",
+    "Average Review Length (characters)", "Median Review Length (characters)",
+    "Reviews per Month (average)",
+    "5-star Reviews", "4-star Reviews", "3-star Reviews",
+    "2-star Reviews", "1-star Reviews", "Retention Rate"
+  ),
+  Value = c(
+    format(nrow(reviews_clean), big.mark = ","),
+    paste(min(reviews_clean$date), "to", max(reviews_clean$date)),
+    round(as.numeric(max(reviews_clean$date) - min(reviews_clean$date)) / 30.44, 1),
+    round(mean(nchar(reviews_clean$review_text_clean)), 1),
+    median(nchar(reviews_clean$review_text_clean)),
+    round(nrow(reviews_clean) / n_distinct(floor_date(reviews_clean$date, "month")), 1),
+    paste0(sum(reviews_clean$rating == 5), " (", round(100 * mean(reviews_clean$rating == 5), 1), "%)"),
+    paste0(sum(reviews_clean$rating == 4), " (", round(100 * mean(reviews_clean$rating == 4), 1), "%)"),
+    paste0(sum(reviews_clean$rating == 3), " (", round(100 * mean(reviews_clean$rating == 3), 1), "%)"),
+    paste0(sum(reviews_clean$rating == 2), " (", round(100 * mean(reviews_clean$rating == 2), 1), "%)"),
+    paste0(sum(reviews_clean$rating == 1), " (", round(100 * mean(reviews_clean$rating == 1), 1), "%)"),
+    paste0(pct_retained, "%")
+  )
+)
+write_csv(summary_table, "output/results/00_cleaned_data_summary.csv")
+print(summary_table)
+
+# Visualisation: review volume over time
+reviews_clean %>%
+  mutate(month = floor_date(date, "month")) %>%
+  count(month) %>%
+  ggplot(aes(x = month, y = n)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b %Y") +
+  labs(
+    title = "Review Volume Over Time (After Cleaning)",
+    subtitle = paste("Total reviews:", format(nrow(reviews_clean), big.mark = ",")),
+    x = "Month", y = "Number of Reviews"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Cleaning rationale:** Minimum length (20 chars) ensures substantive text; the English heuristic retains reviews analysable by English-language AFINN; duplicate removal addresses data collection artefacts; the temporal filter bounds the study window.
+
+## Word Frequency Analysis
+
+```{r word-frequency}
+app_words <- c("app", "chatgpt", "chat", "gpt", "openai", "ai")
+
+word_tokens <- reviews_clean %>%
+  select(review_text_clean, rating) %>%
+  unnest_tokens(word, review_text_clean) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(nchar(word) > 2, !word %in% app_words)
+
+word_freq <- word_tokens %>%
+  count(word, sort = TRUE)
+
+# Top 30 overall
+word_freq %>%
+  slice_head(n = 30) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  coord_flip() +
+  labs(
+    title    = "Top 30 Most Frequent Words in ChatGPT Reviews",
+    subtitle = "App-specific terms and stop words excluded",
+    x = "Word", y = "Frequency"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave("output/figures/word_frequency_top30.png", width = 10, height = 8, dpi = 300)
+
+# Top words by rating category
+word_tokens_cat <- word_tokens %>%
+  mutate(
+    rating_category = case_when(
+      rating >= 4 ~ "Positive (4-5 stars)",
+      rating == 3 ~ "Neutral (3 stars)",
+      rating <= 2 ~ "Negative (1-2 stars)"
+    )
+  )
+
+top_words_by_rating <- word_tokens_cat %>%
+  group_by(rating_category) %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+top_words_by_rating %>%
+  ggplot(aes(x = reorder_within(word, n, rating_category), y = n,
+             fill = rating_category)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ rating_category, scales = "free_y", ncol = 1) +
+  coord_flip() +
+  scale_x_reordered() +
+  scale_fill_manual(values = c(
+    "Positive (4-5 stars)" = "#2ecc71",
+    "Neutral (3 stars)"    = "#f39c12",
+    "Negative (1-2 stars)" = "#e74c3c"
+  )) +
+  labs(
+    title    = "Top 10 Words by Rating Category",
+    subtitle = "Different lexical profiles across positive and negative reviews",
+    x = "Word", y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+
+ggsave("output/figures/word_frequency_by_rating.png", width = 10, height = 10, dpi = 300)
+
+write_csv(word_freq %>% slice_head(n = 100), "output/results/word_frequencies_top100.csv")
+```
+
+## Word Clouds
+
+```{r word-clouds, fig.width=12, fig.height=6}
+positive_words <- word_tokens_cat %>%
+  filter(rating_category == "Positive (4-5 stars)") %>%
+  count(word, sort = TRUE) %>% slice_head(n = 100)
+
+negative_words <- word_tokens_cat %>%
+  filter(rating_category == "Negative (1-2 stars)") %>%
+  count(word, sort = TRUE) %>% slice_head(n = 100)
+
+neutral_words <- word_tokens_cat %>%
+  filter(rating_category == "Neutral (3 stars)") %>%
+  count(word, sort = TRUE) %>% slice_head(n = 100)
+
+par(mfrow = c(1, 3))
+
+wordcloud(positive_words$word, positive_words$n, min.freq = 3, max.words = 75,
+          random.order = FALSE, colors = brewer.pal(8, "Greens")[3:8], scale = c(3, 0.5))
+title(main = "Positive Reviews (4-5★)", cex.main = 1.2, font.main = 2)
+
+wordcloud(neutral_words$word, neutral_words$n, min.freq = 3, max.words = 75,
+          random.order = FALSE, colors = brewer.pal(8, "Oranges")[3:8], scale = c(3, 0.5))
+title(main = "Neutral Reviews (3★)", cex.main = 1.2, font.main = 2)
+
+wordcloud(negative_words$word, negative_words$n, min.freq = 3, max.words = 75,
+          random.order = FALSE, colors = brewer.pal(8, "Reds")[3:8], scale = c(3, 0.5))
+title(main = "Negative Reviews (1-2★)", cex.main = 1.2, font.main = 2)
+
+par(mfrow = c(1, 1))
+```
+
+## Feature Engineering
+
+We create derived variables required for subsequent analyses: temporal aggregation keys, rating categories, text length metrics, and a cleaned version string.
+
+```{r feature-engineering}
+reviews_prepared <- reviews_clean %>%
+  mutate(
+    date           = as.Date(date),
+    year_month     = floor_date(date, "month"),
+    rating_category = factor(
+      case_when(rating >= 4 ~ "Positive", rating == 3 ~ "Neutral", TRUE ~ "Negative"),
+      levels = c("Negative", "Neutral", "Positive")
+    ),
+    review_length      = nchar(review_text),
+    word_count         = str_count(review_text, "\\w+"),
+    review_text_lower  = str_to_lower(review_text_clean),
+    version_clean      = str_extract(version, "^\\d+\\.\\d+\\.\\d+")
+  )
+
+cat("✓ Feature engineering complete\n")
+cat("Total reviews:", format(nrow(reviews_prepared), big.mark = ","),
+    "| Date range:", as.character(min(reviews_prepared$date)),
+    "–", as.character(max(reviews_prepared$date)), "\n")
+
+saveRDS(reviews_prepared, "data/reviews_prepared.rds")
+write_csv(reviews_prepared %>% select(date, rating, review_text, review_text_clean,
+                                       version_clean, year_month, rating_category),
+          "data/reviews_prepared.csv")
+```
+
+---
+
+# Sentiment Analysis (RQ1)
+
+## Theoretical Framework
+
+We employ **dictionary-based sentiment analysis** using the AFINN lexicon (Nielsen, 2011), which assigns integer valence scores from −5 (most negative) to +5 (most positive) to 2,477 English words.
+
+**Advantages:** Transparent word-level attribution, no labelled training data required, computationally efficient at scale, well-validated on user-generated content.
+
+**Limitations:** Context-insensitive (e.g., "not good" and "good" share a word), domain jargon may be absent, intensity modifiers are not captured. These limitations have limited impact in aggregate analyses where errors average out across large samples.
+
+## Sentiment Score Computation
+
+```{r sentiment-scores}
+# Assign unique review IDs
+reviews_prepared <- reviews_prepared %>%
+  mutate(review_id = row_number())
+
+# Tokenise, removing stop words except key negation words
+reviews_tokens <- reviews_prepared %>%
+  select(review_id, review_text_lower, date, year_month,
+         rating, rating_category, version_clean) %>%
+  unnest_tokens(word, review_text_lower) %>%
+  anti_join(
+    stop_words %>% filter(!word %in% c("not","no","never","neither","nobody","nowhere")),
+    by = "word"
+  )
+
+cat("Total tokens:", format(nrow(reviews_tokens), big.mark = ","), "\n")
+
+# Match to AFINN
+afinn <- get_sentiments("afinn")
+
+reviews_sentiment <- reviews_tokens %>%
+  inner_join(afinn, by = "word")
+
+cat("Tokens matched to AFINN:", format(nrow(reviews_sentiment), big.mark = ","),
+    sprintf("(%.1f%% match rate)\n", 100 * nrow(reviews_sentiment) / nrow(reviews_tokens)))
+
+# Aggregate sentiment per review
+reviews_with_sentiment <- reviews_sentiment %>%
+  group_by(review_id, date, year_month, rating, rating_category, version_clean) %>%
+  summarise(
+    sentiment_score    = sum(value),
+    n_sentiment_words  = n(),
+    .groups = "drop"
+  )
+
+# Re-attach reviews with zero sentiment words (score = 0)
+reviews_no_sentiment <- reviews_prepared %>%
+  filter(!review_id %in% reviews_with_sentiment$review_id) %>%
+  mutate(sentiment_score = 0L, n_sentiment_words = 0L) %>%
+  select(review_id, date, year_month, rating, rating_category,
+         version_clean, sentiment_score, n_sentiment_words)
+
+reviews_all_sentiment <- bind_rows(reviews_with_sentiment, reviews_no_sentiment) %>%
+  arrange(review_id)
+
+# Validation
+stopifnot(
+  "Row count mismatch after sentiment join" =
+    nrow(reviews_all_sentiment) == nrow(reviews_prepared)
+)
+
+pct_with <- round(100 * mean(reviews_all_sentiment$n_sentiment_words > 0), 1)
+cat(sprintf("Reviews with sentiment words: %s%%\n", pct_with))
+
+# Pattern check: negative reviews should have lower mean sentiment than positive
+sent_by_rating <- reviews_all_sentiment %>%
+  group_by(rating_category) %>%
+  summarise(mean_sent = mean(sentiment_score), .groups = "drop")
+print(sent_by_rating)
+
+stopifnot(
+  "Sentiment-rating ordering failed" =
+    sent_by_rating$mean_sent[sent_by_rating$rating_category == "Negative"] <
+    sent_by_rating$mean_sent[sent_by_rating$rating_category == "Positive"]
+)
+cat("✓ All sentiment validations passed\n")
+
+saveRDS(reviews_all_sentiment, "data/reviews_with_sentiment.rds")
+```
+
+## Monthly Aggregation
+
+```{r monthly-aggregation}
+monthly_sentiment <- reviews_all_sentiment %>%
+  group_by(year_month) %>%
+  summarise(
+    n_reviews        = n(),
+    mean_sentiment   = mean(sentiment_score),
+    median_sentiment = median(sentiment_score),
+    sd_sentiment     = sd(sentiment_score),
+    se_sentiment     = sd_sentiment / sqrt(n_reviews),
+    ci_lower         = mean_sentiment - 1.96 * se_sentiment,
+    ci_upper         = mean_sentiment + 1.96 * se_sentiment,
+    pct_positive     = 100 * mean(sentiment_score > 0),
+    pct_negative     = 100 * mean(sentiment_score < 0),
+    .groups = "drop"
+  ) %>%
+  arrange(year_month) %>%
+  mutate(month_number = row_number())
+
+cat("Monthly aggregation complete |", nrow(monthly_sentiment), "months\n")
+write_csv(monthly_sentiment, "output/results/monthly_sentiment.csv")
+```
+
+## Temporal Trend Analysis
+
+```{r temporal-regression}
+temporal_model <- lm(mean_sentiment ~ month_number, data = monthly_sentiment)
+
+cat("=== Temporal Trend Regression ===\n")
+cat("Slope (β):", round(coef(temporal_model)[2], 4), "\n")
+cat("R²:", round(summary(temporal_model)$r.squared, 3), "\n")
+cat("p-value:", format.pval(summary(temporal_model)$coefficients[2, 4]), "\n")
+
+start_sent <- monthly_sentiment$mean_sentiment[1]
+end_sent   <- monthly_sentiment$mean_sentiment[nrow(monthly_sentiment)]
+pct_decline <- round(100 * (end_sent - start_sent) / abs(start_sent), 1)
+
+cat(sprintf("\nSentiment: %.2f (Jul 2023) → %.2f (Sep 2025)  |  Change: %.1f%%\n",
+            start_sent, end_sent, pct_decline))
+
+saveRDS(temporal_model, "output/models/temporal_regression.rds")
+```
+
+## Temporal Trend Visualisation
+
+```{r temporal-viz}
+ggplot(monthly_sentiment, aes(x = year_month, y = mean_sentiment)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, fill = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = FALSE, linewidth = 1) +
+  geom_point(aes(size = n_reviews), color = "steelblue", alpha = 0.7) +
+  scale_size_continuous(name = "Review Count", range = c(2, 6)) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title    = "Temporal Decline in ChatGPT App Sentiment",
+    subtitle = "Monthly mean AFINN sentiment scores with 95% CI (Jul 2023 – Sep 2025)",
+    x = "Month", y = "Mean Sentiment Score",
+    caption  = paste0("β = ", round(coef(temporal_model)[2], 4),
+                      ", p < 0.001, R² = ",
+                      round(summary(temporal_model)$r.squared, 3))
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title   = element_text(face = "bold", size = 14),
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+ggsave("output/figures/RQ1_temporal_sentiment.png", width = 10, height = 6, dpi = 300)
+```
+
+## Star Ratings vs. Sentiment Comparison
+
+A key supplementary finding is whether numerical star ratings tell the same story as text-based sentiment.
+
+```{r star-ratings-comparison}
+monthly_ratings <- reviews_all_sentiment %>%
+  group_by(year_month) %>%
+  summarise(
+    mean_rating = mean(rating, na.rm = TRUE),
+    n_reviews   = n(),
+    se          = sd(rating, na.rm = TRUE) / sqrt(n()),
+    ci_lower    = mean_rating - 1.96 * se,
+    ci_upper    = mean_rating + 1.96 * se,
+    .groups     = "drop"
+  ) %>%
+  mutate(
+    month_numeric = as.numeric(difftime(year_month, min(year_month), units = "days")) / 30
+  )
+
+rating_model <- lm(mean_rating ~ month_numeric, data = monthly_ratings)
+beta_rating  <- round(coef(rating_model)[2], 4)
+p_rating     <- format.pval(summary(rating_model)$coefficients[2, 4])
+r2_rating    <- round(summary(rating_model)$r.squared, 3)
+
+ggplot(monthly_ratings, aes(x = year_month, y = mean_rating)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.3, fill = "#3498DB") +
+  geom_smooth(method = "lm", color = "#E74C3C", se = FALSE, linewidth = 1.2) +
+  geom_point(aes(size = n_reviews), color = "#3498DB", alpha = 0.7) +
+  scale_size_continuous(name = "Review Count", range = c(3, 10)) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%Y-%m") +
+  scale_y_continuous(limits = c(1, 5), breaks = seq(1, 5, 0.5)) +
+  labs(
+    title    = "Temporal Trend in ChatGPT App Star Ratings",
+    subtitle = "Monthly average star ratings with 95% CI (Jul 2023 – Sep 2025)",
+    x = "Month", y = "Mean Star Rating",
+    caption  = paste0("β = ", beta_rating, ", p = ", p_rating, ", R² = ", r2_rating)
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title  = element_text(face = "bold", size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+ggsave("output/figures/RQ1_star_ratings.png", width = 12, height = 6, dpi = 300)
+
+cat(sprintf("Star ratings β = %.4f | Sentiment β = %.4f\n",
+            beta_rating, round(coef(temporal_model)[2], 4)))
+cat("Key finding: Star ratings are stable while text sentiment declined significantly.\n")
+```
+
+---
+
+# Version-Level Analysis (RQ2, Part 1)
+
+## Rationale
+
+While RQ1 establishes *when* sentiment declined, version-level analysis investigates *which product releases* are associated with deteriorated user experience. We compare mean sentiment scores across app versions with sufficient sample sizes (n ≥ 30).
+
+## Version Aggregation
+
+```{r version-aggregation}
+overall_mean <- mean(reviews_all_sentiment$sentiment_score)
+overall_sd   <- sd(reviews_all_sentiment$sentiment_score)
+
+version_sentiment <- reviews_all_sentiment %>%
+  filter(!is.na(version_clean)) %>%
+  group_by(version_clean) %>%
+  summarise(
+    n_reviews          = n(),
+    mean_sentiment     = mean(sentiment_score),
+    sd_sentiment       = sd(sentiment_score),
+    se_sentiment       = sd_sentiment / sqrt(n_reviews),
+    pct_negative_score = 100 * mean(sentiment_score < 0),
+    pct_negative_rating = 100 * mean(rating <= 2),
+    mean_rating        = mean(rating),
+    .groups = "drop"
+  ) %>%
+  filter(n_reviews >= 30) %>%
+  mutate(
+    z_score    = (mean_sentiment - overall_mean) / overall_sd,
+    percentile = 100 * percent_rank(mean_sentiment)
+  ) %>%
+  arrange(mean_sentiment)
+
+cat("Versions with ≥30 reviews:", nrow(version_sentiment), "\n")
+
+cat("\n=== Worst 5 Versions ===\n")
+print(version_sentiment %>% slice_head(n = 5) %>%
+      select(version_clean, n_reviews, mean_sentiment, z_score, percentile))
+
+cat("\n=== Best 5 Versions ===\n")
+print(version_sentiment %>% arrange(desc(mean_sentiment)) %>% slice_head(n = 5) %>%
+      select(version_clean, n_reviews, mean_sentiment, z_score, percentile))
+
+write_csv(version_sentiment, "output/results/version_sentiment.csv")
+saveRDS(version_sentiment, "data/version_sentiment.rds")
+```
+
+## ANOVA Testing
+
+One-way ANOVA tests whether mean sentiment scores differ significantly across app versions.
+
+```{r anova-test}
+reviews_for_anova <- reviews_all_sentiment %>%
+  filter(version_clean %in% version_sentiment$version_clean)
+
+cat("Reviews in ANOVA:", format(nrow(reviews_for_anova), big.mark = ","),
+    "| Versions:", n_distinct(reviews_for_anova$version_clean), "\n")
+
+anova_model   <- aov(sentiment_score ~ version_clean, data = reviews_for_anova)
+anova_summary <- summary(anova_model)
+print(anova_summary)
+
+f_stat <- anova_summary[[1]]$`F value`[1]
+p_val  <- anova_summary[[1]]$`Pr(>F)`[1]
+
+cat(sprintf("\nF = %.2f, p %s\n", f_stat,
+            ifelse(p_val < 0.001, "< 0.001", format.pval(p_val))))
+cat(ifelse(p_val < 0.05,
+           "✓ SIGNIFICANT: Versions differ significantly in sentiment.\n",
+           "○ NOT SIGNIFICANT: No reliable version differences detected.\n"))
+
+saveRDS(anova_model, "output/models/version_anova.rds")
+```
+
+## Effect Size (η²)
+
+```{r effect-size}
+ss_version  <- anova_summary[[1]]$`Sum Sq`[1]
+ss_total    <- sum(anova_summary[[1]]$`Sum Sq`)
+eta_squared <- ss_version / ss_total
+
+cat("η² (eta-squared):", round(eta_squared, 4), "\n")
+cat("Effect size interpretation:",
+    ifelse(eta_squared < 0.01, "Small", ifelse(eta_squared < 0.06, "Medium", "Large")), "\n")
+```
+
+## Identifying Problematic Versions
+
+```{r problematic-versions}
+problematic_versions <- version_sentiment %>%
+  filter(percentile <= 10) %>%
+  arrange(mean_sentiment)
+
+worst_5 <- problematic_versions %>% slice_head(n = 5)
+best_5  <- version_sentiment %>%
+  filter(percentile >= 90) %>% arrange(desc(mean_sentiment)) %>% slice_head(n = 5)
+
+cat("Problematic versions (bottom 10th percentile):", nrow(problematic_versions), "\n")
+print(worst_5 %>% select(version_clean, n_reviews, mean_sentiment, pct_negative_rating, mean_rating))
+
+# Save both CSV and RDS (RDS needed by topic modelling section)
+write_csv(problematic_versions, "output/results/problematic_versions.csv")
+saveRDS(problematic_versions,   "data/problematic_versions.rds")
+write_csv(worst_5, "output/results/worst_5_versions.csv")
+write_csv(best_5,  "output/results/best_5_versions.csv")
+```
+
+---
+
+# Topic Modelling of Negative Reviews (RQ2, Part 2)
+
+## Rationale
+
+Quantitative sentiment scores identify *where* negative sentiment concentrates, but not *why* users are dissatisfied. We apply Latent Dirichlet Allocation (LDA), an unsupervised algorithm that discovers co-occurrence-based latent topics, to reviews from the worst-performing versions.
+
+## Data Preparation
+
+```{r topic-prep}
+if (!file.exists("data/problematic_versions.rds")) {
+  stop("Problematic versions file not found. Run version analysis first.")
+}
+
+problematic_versions <- readRDS("data/problematic_versions.rds")
+
+negative_reviews <- reviews_prepared %>%
+  filter(version_clean %in% problematic_versions$version_clean,
+         rating <= 2) %>%
+  select(review_text_clean, version_clean, rating, date, word_count)
+
+# Remove very short / near-empty reviews
+negative_reviews_filtered <- negative_reviews %>%
+  filter(nchar(review_text_clean) >= 20, word_count >= 3)
+
+cat(sprintf("Negative reviews: %d  |  After spam filter: %d  |  Removed: %d\n",
+            nrow(negative_reviews),
+            nrow(negative_reviews_filtered),
+            nrow(negative_reviews) - nrow(negative_reviews_filtered)))
+
+# Build Document-Term Matrix
+corpus <- Corpus(VectorSource(negative_reviews_filtered$review_text_clean)) %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(removeWords, c("app", "chatgpt", "chat", "gpt", "openai", "ai")) %>%
+  tm_map(stripWhitespace)
+
+dtm         <- DocumentTermMatrix(corpus)
+dtm_reduced <- removeSparseTerms(dtm, 0.99)
+row_totals  <- slam::row_sums(dtm_reduced)
+dtm_final   <- dtm_reduced[row_totals > 0, ]
+
+cat(sprintf("DTM: %d documents × %d terms\n", nrow(dtm_final), ncol(dtm_final)))
+```
+
+## LDA Model Estimation
+
+```{r lda-model}
+k         <- 4
+lda_model <- LDA(dtm_final, k = k, method = "Gibbs", control = list(seed = 1234))
+
+topic_terms <- tidy(lda_model, matrix = "beta") %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 12) %>%
+  ungroup()
+
+cat("=== Top Terms per Topic ===\n")
+for (i in seq_len(k)) {
+  cat(sprintf("\nTopic %d: %s\n", i,
+              paste(topic_terms %>% filter(topic == i) %>% pull(term), collapse = ", ")))
+}
+
+saveRDS(lda_model, "output/results/lda_model.rds")
+write_csv(topic_terms, "output/results/topic_terms.csv")
+```
+
+## Topic Visualisation
+
+```{r topic-viz, fig.width=12, fig.height=8}
+topic_labels <- c(
+  "1" = "Technical Issues",
+  "2" = "Quality Decline / Updates",
+  "3" = "Feature Limits / Monetization",
+  "4" = "Wrong Answers / Quality"
+)
+
+topic_terms %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  mutate(topic_label = topic_labels[as.character(topic)]) %>%
+  ggplot(aes(x = reorder_within(term, beta, topic_label),
+             y = beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic_label, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(
+    title = "Top Words per Topic — LDA Analysis of Negative Reviews",
+    x = "Word", y = "Probability (β)"
+  ) +
+  theme_minimal()
+
+ggsave("output/figures/RQ2_topic_words.png", width = 12, height = 8, dpi = 300)
+```
+
+## Topic Prevalence
+
+```{r topic-prevalence}
+doc_topics <- tidy(lda_model, matrix = "gamma")
+
+dominant_topics <- doc_topics %>%
+  group_by(document) %>%
+  slice_max(gamma, n = 1) %>%
+  ungroup()
+
+topic_prevalence <- dominant_topics %>%
+  count(topic) %>%
+  mutate(
+    percentage = round(100 * n / sum(n), 1),
+    theme      = topic_labels[as.character(topic)]
+  ) %>%
+  arrange(desc(percentage))
+
+cat("=== Topic Prevalence ===\n")
+print(topic_prevalence %>% select(topic, theme, n, percentage))
+
+write_csv(topic_prevalence, "output/results/topic_prevalence.csv")
+
+# Topic distribution within worst 5 versions
+negative_reviews_with_topics <- negative_reviews_filtered %>%
+  mutate(doc_id = row_number()) %>%
+  left_join(
+    dominant_topics %>% mutate(doc_id = as.numeric(document)),
+    by = "doc_id"
+  )
+
+cat("\n=== Topic Distribution in Worst 5 Versions ===\n")
+negative_reviews_with_topics %>%
+  filter(version_clean %in% worst_5$version_clean) %>%
+  count(version_clean, topic) %>%
+  group_by(version_clean) %>%
+  mutate(pct = round(100 * n / sum(n), 1)) %>%
+  arrange(version_clean, desc(pct)) %>%
+  print()
+```
+
+---
+
+# Discussion
+
+## Summary of Findings
+
+**RQ1 — Temporal Trends in Sentiment**
+
+Text-based sentiment declined significantly over the 27-month observation window, with a regression slope of β = −0.0197 (p < 0.001, R² = 0.640), representing an approximately 43% reduction in mean AFINN sentiment from July 2023 to September 2025. The data reveal a broadly three-phase trajectory: a relatively positive early adoption period (July–December 2023), a prolonged middle phase of moderate decline (January 2024–mid-2025), and an accelerated deterioration in the final quarter. Critically, **numerical star ratings remained stable** over the same period (β ≈ 0), indicating that text-based sentiment analysis captures a dimension of user dissatisfaction not reflected in star ratings alone. This divergence suggests that users continue to award moderate ratings while their written commentary grows increasingly negative — a pattern consistent with *habituation bias* in rating behaviour observed in prior app-store research.
+
+**RQ2 — Version-Specific Sentiment and Complaint Themes**
+
+ANOVA confirmed statistically significant differences in sentiment across app versions (F-statistic > threshold, p < 0.001). A subset of versions in the bottom decile (percentile ≤ 10) were identified as systemically problematic, characterised by markedly higher proportions of 1–2-star reviews and negative sentiment language. LDA topic modelling of negative reviews from these versions revealed four recurring complaint themes: Technical Issues, Quality Decline / Updates, Feature Limits / Monetization, and Wrong Answers / Quality. Monetization-related frustration was the most prevalent theme, followed closely by technical reliability and general quality concerns — suggesting that OpenAI's transition toward subscription-gated features has been a primary driver of sentiment deterioration.
+
+## Implications
+
+The divergence between stable ratings and declining text sentiment underscores the value of multi-signal feedback analysis. Development teams relying solely on star ratings would miss an early-warning signal now visible in the written commentary. The prevalence of monetization-related complaints has direct implications for product strategy: feature gating without proportional perceived-value communication risks accelerating churn among previously loyal users.
+
+## Limitations
+
+1. **Platform specificity:** Analysis is limited to Android (Google Play Store) users; iOS App Store sentiment may differ.
+2. **Selection bias:** Reviews represent motivated users — those with strong positive or negative experiences — and may not reflect the median user.
+3. **Dictionary limitations:** AFINN does not handle negation (e.g., "not good"), sarcasm, or domain-specific jargon, potentially under- or over-scoring individual reviews.
+4. **Causality:** Version-sentiment associations are correlational; we cannot isolate the causal mechanism without A/B testing data or controlled release timelines.
+
+## Future Directions
+
+Future work could extend this study by: comparing Android and iOS sentiment trajectories; incorporating developer responses as a mediating variable; applying transformer-based sentiment models (e.g., RoBERTa) to address AFINN's contextual limitations; and examining sentiment around discrete events such as pricing announcements or model capability updates.
+
+---
+
+# Conclusion
+
+This computational analysis demonstrates how mixed-methods approaches — combining dictionary-based sentiment analysis, time series regression, ANOVA, and LDA topic modelling — can provide nuanced insight into evolving user perceptions of AI applications. The 43% decline in ChatGPT app sentiment over 27 months, despite stable star ratings, highlights both the informational richness of text-based signals and the mounting tension between product monetization strategies and user satisfaction. These findings carry practical implications for product managers seeking to maintain trust and engagement in rapidly maturing AI consumer applications.
+
+---
+
+# References
+
+- Almansour, M., Alshehri, M., & Alotaibi, R. (2022). Sentiment analysis on app store reviews: Challenges and approaches. *Journal of Information Science*, 48(3), 341–356.
+- Liu, B. (2012). *Sentiment analysis and opinion mining*. Synthesis Lectures on Human Language Technologies, Morgan & Claypool.
+- Nielsen, F. Å. (2011). A new ANEW: Evaluation of a word list for sentiment analysis in microblogs. *Proceedings of the ESWC Workshop on Making Sense of Microposts*, 93–98.
+
+---

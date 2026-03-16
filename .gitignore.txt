@@ -1,0 +1,24 @@
+# R session and history
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Knit cache (large, regeneratable)
+*_cache/
+*_files/
+
+# Intermediate R data files (regeneratable by running the .Rmd)
+data/reviews_prepared.rds
+data/reviews_with_sentiment.rds
+data/version_sentiment.rds
+data/problematic_versions.rds
+output/models/
+
+# The raw source data — too large for GitHub (865K rows)
+# Download from: https://www.kaggle.com/datasets/ashishkumarak/chatgpt-reviews-daily-updated
+data/chatgpt_reviews.csv
+
+# OS files
+.DS_Store
+Thumbs.db
