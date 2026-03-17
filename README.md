@@ -1,8 +1,6 @@
 # Temporal Dynamics of User Sentiment: A Computational Analysis of ChatGPT App Reviews
 
-**Hammad Mirza** · York University · ITEC 6810 Computational Social Science · Fall 2025
-
----
+**Hammad Mirza** · York University
 
 ## Overview
 
